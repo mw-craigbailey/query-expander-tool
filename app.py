@@ -55,8 +55,11 @@ genai.configure(api_key=api_key)
 # ---------- FILE UPLOAD ----------
 uploaded_file = st.file_uploader("Upload your CSV with a single column: 'seed_query'", type=["csv"])
 
-# ---------- CONFIG ----------
-num_expansions = st.slider("Number of expansions per seed query", min_value=1, max_value=25, value=5)
+# ---------- EXPANSION STRATEGY ----------
+expansion_strategy = st.radio("Expansion Strategy", ["User-defined", "Model-defined"], horizontal=True)
+
+if expansion_strategy == "User-defined":
+    num_expansions = st.slider("Number of expansions per seed query", min_value=1, max_value=25, value=5)
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
@@ -67,7 +70,7 @@ if uploaded_file:
 
     st.success(f"Loaded {len(df)} seed queries.")
 
-    if st.button("🔁 Expand All Queries"):
+    if st.button("Generate Synthetic Queries"):
         expanded_rows = []
         model = genai.GenerativeModel(model_name="models/gemini-2.5-pro-preview-03-25")
 
@@ -75,19 +78,41 @@ if uploaded_file:
             for index, row in df.iterrows():
                 seed = row['seed_query']
 
-                prompt = f"""
-                The user provided a base query: "{seed}"
+                if expansion_strategy == "User-defined":
+                    prompt = f"""
+                    The user provided a base query: "{seed}"
 
-                Generate {num_expansions} short to mid-tail search queries that simulate diversified user intents (fanout) based on this input.
-                Each query should be phrased like a real-world search input (max 12 words). Avoid full sentences or overly formal phrasing.
+                    Generate {num_expansions} short to mid-tail search queries that simulate diversified user intents (fanout) based on this input.
+                    Each query should be phrased like a real-world search input (max 12 words). Avoid full sentences or overly formal phrasing.
 
-                For each query, output:
-                - "query": [the generated search phrase]
-                - "intent_type": [ambiguous, underspecified, exploratory, multi-faceted, comparative, task-oriented, or temporal]
-                - "semantic_relationship": [describe how this relates to the original search]
+                    For each query, output:
+                    - "query": [the generated search phrase]
+                    - "intent_type": [ambiguous, underspecified, exploratory, multi-faceted, comparative, task-oriented, or temporal]
+                    - "semantic_relationship": [describe how this relates to the original search]
 
-                Respond only with valid raw JSON. Do not include markdown or backticks.
-                """
+                    Respond only with valid raw JSON. Do not include markdown or backticks.
+                    """
+                else:
+                    prompt = f"""
+                    The user entered the query: "{seed}"
+
+                    First, determine how many different search queries should be generated to explore this query from multiple dimensions. Think in terms of breadth, ambiguity, comparison, and user needs.
+
+                    Then, generate the full list of that number of search queries using short to mid-tail phrasing. Each query should include:
+
+                    - "query": [the generated query]
+                    - "intent_type": [ambiguous, underspecified, exploratory, multi-faceted, comparative, task-oriented, or temporal]
+                    - "semantic_relationship": [describe how this relates to the original query]
+
+                    Finally, respond in JSON as:
+                    {{
+                      "reasoning": "...",
+                      "target_number": 20,
+                      "actual_queries": [ ... ]
+                    }}
+
+                    Do not include markdown or backticks. Do not return more than 100 total queries.
+                    """
 
                 try:
                     response = model.generate_content(prompt)
@@ -98,18 +123,28 @@ if uploaded_file:
                     elif raw.startswith("```"):
                         raw = raw.replace("```", "").strip()
 
-                    parsed = json.loads(raw)
-
-                    if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
-                        for item in parsed:
+                    if expansion_strategy == "User-defined":
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+                            for item in parsed:
+                                expanded_rows.append({
+                                    "Original Seed Query": seed,
+                                    "Synth Query": item.get("query", "MISSING"),
+                                    "Intent Type": item.get("intent_type", "MISSING"),
+                                    "Semantic Relationship": item.get("semantic_relationship", "MISSING")
+                                })
+                        else:
+                            raise ValueError("Gemini response was not a list of dictionaries")
+                    else:
+                        structured = json.loads(raw)
+                        queries = structured.get("actual_queries", [])
+                        for item in queries:
                             expanded_rows.append({
                                 "Original Seed Query": seed,
                                 "Synth Query": item.get("query", "MISSING"),
                                 "Intent Type": item.get("intent_type", "MISSING"),
                                 "Semantic Relationship": item.get("semantic_relationship", "MISSING")
                             })
-                    else:
-                        raise ValueError("Gemini response was not a list of dictionaries")
 
                 except Exception as e:
                     expanded_rows.append({
@@ -124,9 +159,13 @@ if uploaded_file:
         output_df = pd.DataFrame(expanded_rows)
         st.success("Expansion complete.")
 
-        st.markdown("### Preview of expanded results")
+        st.markdown("### 📊 Intent Type Breakdown")
+        count_df = output_df['Intent Type'].value_counts().rename_axis("Intent Type").reset_index(name="Count")
+        st.bar_chart(count_df.set_index("Intent Type"))
+
+        st.markdown("### 📋 Preview of Expanded Results")
         st.markdown("<div class='custom-table'>", unsafe_allow_html=True)
-        st.write(output_df.sample(min(10, len(output_df))))
+        st.dataframe(output_df.sample(min(10, len(output_df))), use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         csv = output_df.to_csv(index=False).encode('utf-8')
